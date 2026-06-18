@@ -15,6 +15,9 @@ export const webmMimeType = `${webmContentType};codecs=vp9,opus`;
 export const vp9ContentType: ContentType = 'video/webm';
 export const vp9MimeType = `${vp9ContentType};codecs=vp09.00.10.08,opus`;
 
+export const audioWebmMimeType = 'audio/webm;codecs=opus';
+export const audioOggMimeType = 'audio/ogg;codecs=opus';
+
 export const getRecordingMimeTypesForExtension = (extension: string) => {
   const webmVp9MimeTypes = [webmMimeType, vp9MimeType];
 

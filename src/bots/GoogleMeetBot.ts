@@ -13,7 +13,7 @@ import { retryActionWithWait } from '../util/resilience';
 import { uploadDebugImage } from '../services/bugService';
 import createBrowserContext, { isExternalBrowserContext } from '../lib/chromium';
 import { GOOGLE_LOBBY_MODE_HOST_TEXT, GOOGLE_REQUEST_DENIED, GOOGLE_REQUEST_TIMEOUT } from '../constants';
-import { getRecordingMimeTypesForExtension } from '../lib/recording';
+import { audioOggMimeType, audioWebmMimeType } from '../lib/recording';
 import { getGoogleMeetDisplayName } from '../util/googleMeetDisplayName';
 
 export class GoogleMeetBot extends MeetBotBase {
@@ -683,7 +683,7 @@ export class GoogleMeetBot extends MeetBotBase {
       }
     });
 
-    const { mimeTypes } = getRecordingMimeTypesForExtension(config.uploaderFileExtension);
+    const mimeTypes = [audioWebmMimeType, audioOggMimeType];
 
     // Inject the MediaRecorder code into the browser context using page.evaluate
     await this.page.evaluate(
@@ -741,7 +741,8 @@ export class GoogleMeetBot extends MeetBotBase {
           }
 
           console.log(`Media Recorder will use ${selectedMimeType} codecs...`);
-          const mediaRecorder = new MediaRecorder(stream, { mimeType: selectedMimeType });
+          const audioOnlyStream = new MediaStream(stream.getAudioTracks());
+          const mediaRecorder = new MediaRecorder(audioOnlyStream, { mimeType: selectedMimeType, audioBitsPerSecond: 32000 });
           console.log(`Media Recorder actual mime type: ${mediaRecorder.mimeType}`);
           let chunkUploadChain: Promise<void> = Promise.resolve();
           let isStoppingRecording = false;
