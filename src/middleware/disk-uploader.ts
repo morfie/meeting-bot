@@ -54,6 +54,13 @@ export interface IUploader {
 
 // Save to disk and upload in one session
 // TODO Add illustrative logs to track or replay the journey
+interface SegmentResult {
+  success: boolean;
+  key: string;
+  url?: string;
+  index: number;
+}
+
 class DiskUploader implements IUploader {
   private _token: string;
   private _teamId: string;
@@ -62,10 +69,12 @@ class DiskUploader implements IUploader {
   private _botId: string;
   private _namePrefix: string;
   private _tempFileId: string;
+  private _originalTempFileId: string;
   private _logger: Logger;
   private _meetingLink?: string;
 
   private readonly UPLOAD_CHUNK_SIZE = 50 * 1024 * 1024; // 50 MiB
+  private readonly SEGMENT_SIZE_THRESHOLD = 45 * 1024 * 1024; // 45 MiB — rotate segment before this
 
   private readonly MAX_CHUNK_UPLOAD_RETRIES = 3;
   private readonly MAX_FILE_UPLOAD_RETRIES = 3;
@@ -82,6 +91,14 @@ class DiskUploader implements IUploader {
   private lastStorageDetails?: Record<string, any>;
   private recordingDuration?: number;
   private firstChunkReceivedAt?: number;
+
+  // Segment tracking for rolling upload
+  private segmentIndex = 1;
+  private currentSegmentBytes = 0;
+  private isRotating = false;
+  private _segmentBaseTime?: string;
+  private backgroundUploads: Array<Promise<SegmentResult>> = [];
+  private completedSegments: SegmentResult[] = [];
 
   private queue: Buffer[];
   private writing: boolean;
@@ -107,6 +124,7 @@ class DiskUploader implements IUploader {
     this._botId = botId;
     this._namePrefix = namePrefix;
     this._tempFileId = tempFileId;
+    this._originalTempFileId = tempFileId;
     this._logger = logger;
     this._meetingLink = meetingLink;
 
@@ -317,11 +335,141 @@ class DiskUploader implements IUploader {
         this.firstChunkReceivedAt = Date.now();
       }
       this.enqueue(data);
+      this.currentSegmentBytes += data.byteLength;
+
+      // Trigger segment rotation when threshold is reached (only for s3 uploader, not screenapp)
+      if (
+        config.uploaderType === 's3' &&
+        !this.isRotating &&
+        this.currentSegmentBytes >= this.SEGMENT_SIZE_THRESHOLD
+      ) {
+        this.isRotating = true;
+        this.rotateSegment().catch((err) => {
+          this._logger.error('Segment rotation failed', { userId: this._userId, error: err });
+          this.isRotating = false;
+        });
+      }
+
       return true;
     } catch(err) {
       this._logger.info('Error: Unable to save the chunk to disk...', this._userId, this._teamId, err);
       return false;
     }
+  }
+
+  private getSegmentBaseTime(): string {
+    if (!this._segmentBaseTime) {
+      this._segmentBaseTime = getTimeString(this._timezone, this._logger);
+    }
+    return this._segmentBaseTime;
+  }
+
+  private buildSegmentKey(index: number): string {
+    const time = this.getSegmentBaseTime();
+    const fileName = fileNameTemplate(this._namePrefix, time);
+    return `meeting-bot/${this._userId}/${fileName}_part${index}${this.fileExtension}`;
+  }
+
+  private buildFinalKey(): string {
+    const time = this.getSegmentBaseTime();
+    const fileName = fileNameTemplate(this._namePrefix, time);
+    // No suffix for single-segment recordings (backward compat)
+    const suffix = this.segmentIndex > 1 ? `_part${this.segmentIndex}` : '';
+    return `meeting-bot/${this._userId}/${fileName}${suffix}${this.fileExtension}`;
+  }
+
+  private async rotateSegment(): Promise<void> {
+    const oldSegmentIndex = this.segmentIndex;
+    const oldTempFileId = this._tempFileId;
+
+    // Drain the write queue so the current segment file is complete
+    await this.waitForWritingFlag();
+    if (this.queue.length > 0) {
+      await this.writeWithRetries();
+    }
+
+    // Switch to next segment file before releasing the lock
+    this.segmentIndex++;
+    this._tempFileId = `${this._originalTempFileId}_part${this.segmentIndex}`;
+    this.currentSegmentBytes = 0;
+    this.isRotating = false;
+
+    this._logger.info('Segment rotation complete, starting background upload', {
+      userId: this._userId,
+      completedSegment: oldSegmentIndex,
+      nextSegment: this.segmentIndex,
+    });
+
+    const oldFilePath = DiskUploader.getFilePath(this._userId, oldTempFileId, this.fileExtension);
+    const key = this.buildSegmentKey(oldSegmentIndex);
+
+    const uploadPromise = this.uploadSegmentFile(oldFilePath, key, oldSegmentIndex);
+    this.backgroundUploads.push(uploadPromise);
+  }
+
+  private async uploadSegmentFile(filePath: string, key: string, index: number): Promise<SegmentResult> {
+    const provider = getStorageProvider();
+    this._logger.info(`Uploading segment ${index} to object storage (${provider.name})`, { key, userId: this._userId });
+
+    const maxAttempts = 2;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        provider.validateConfig();
+        const uploadSuccess = await provider.uploadFile({
+          filePath,
+          key,
+          contentType: this.contentType,
+          metadata: this.getObjectStorageMetadata(),
+          logger: this._logger,
+          partSize: this.UPLOAD_CHUNK_SIZE,
+          concurrency: 4,
+        });
+
+        if (!uploadSuccess) {
+          throw new Error(`Segment ${index} upload returned false`);
+        }
+
+        let url: string | undefined;
+        try {
+          if (provider.name === 's3') {
+            const s3cfg = config.s3CompatibleStorage;
+            url = this.buildS3CompatibleUrl({
+              endpoint: s3cfg.endpoint,
+              region: s3cfg.region!,
+              bucket: s3cfg.bucket!,
+              forcePathStyle: !!s3cfg.forcePathStyle,
+            }, key);
+          } else if (provider.name === 'azure') {
+            if (typeof (provider as any).getSignedUrl === 'function') {
+              url = await (provider as any).getSignedUrl(key, { expiresInSeconds: config.azureBlobStorage.signedUrlTtlSeconds });
+            }
+          }
+        } catch {}
+
+        this._logger.info(`Segment ${index} upload complete`, { key, userId: this._userId });
+        const result: SegmentResult = { success: true, key, url, index };
+        this.completedSegments.push(result);
+
+        // Clean up temp file for this segment
+        try {
+          await fs.promises.unlink(path.resolve(filePath));
+          this._logger.info(`Temp file deleted after segment upload: ${filePath}`);
+        } catch (unlinkErr) {
+          this._logger.warn(`Could not delete temp file for segment ${index}`, unlinkErr);
+        }
+
+        return result;
+      } catch (err) {
+        if (attempt >= maxAttempts) {
+          this._logger.error(`Segment ${index} upload permanently failed`, { key, err });
+          return { success: false, key, index };
+        }
+        const delay = this.RETRY_UPLOAD_DELAY_BASE_MS * Math.pow(2, attempt);
+        this._logger.warn(`Segment ${index} upload attempt ${attempt} failed, retrying in ${delay}ms`);
+        await this.delayPromise(delay);
+      }
+    }
+    return { success: false, key, index };
   }
 
   public setRecordingDuration(durationSeconds: number): void {
@@ -628,100 +776,78 @@ class DiskUploader implements IUploader {
 
   private async uploadRecordingToObjectStorage(): Promise<boolean> {
     const provider = getStorageProvider();
-    this._logger.info(`Uploading recording to object storage using provider: ${provider.name}...`);
+    this._logger.info(`Uploading final segment to object storage using provider: ${provider.name}...`);
 
-    const filePath = DiskUploader.getFilePath(this._userId, this._tempFileId, this.fileExtension);
-    const chunkSize = this.UPLOAD_CHUNK_SIZE;
-
-    // Compose key to preserve existing S3 layout for parity
-    const fileName = fileNameTemplate(this._namePrefix, getTimeString(this._timezone, this._logger));
-    const key = `meeting-bot/${this._userId}/${fileName}${this.fileExtension}`;
-
-    // Validate provider configuration before attempting upload
-    provider.validateConfig();
-
-    const maxAttempts = 2;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        this._logger.info(`Object storage upload attempt ${attempt} of ${maxAttempts} via ${provider.name}.`);
-        const startedAt = Date.now();
-        const uploadSuccess = await provider.uploadFile({
-          filePath,
-          key,
-          contentType: this.contentType,
-          metadata: this.getObjectStorageMetadata(),
-          logger: this._logger,
-          partSize: chunkSize,
-          concurrency: 4,
-        });
-
-        if (!uploadSuccess) {
-          throw new Error(`Failed to upload recording to ${provider.name}`);
-        }
-        const durationMs = Date.now() - startedAt;
-        this._logger.info(`Object storage upload success via ${provider.name}. Duration: ${durationMs} ms, Size: unknown (streamed). Key: ${key}`);
-
-        // Build blobUrl + storage details for notifications
-        try {
-          if (provider.name === 's3') {
-            const s3cfg = config.s3CompatibleStorage;
-            const uploadCfg = {
-              endpoint: s3cfg.endpoint,
-              region: s3cfg.region!,
-              bucket: s3cfg.bucket!,
-              forcePathStyle: !!s3cfg.forcePathStyle,
-            };
-            this.lastUploadedBlobUrl = this.buildS3CompatibleUrl(uploadCfg, key);
-            this.lastStorageDetails = {
-              provider: 's3',
-              bucket: s3cfg.bucket,
-              key,
-              region: s3cfg.region,
-              endpoint: s3cfg.endpoint,
-              forcePathStyle: !!s3cfg.forcePathStyle,
-              url: this.lastUploadedBlobUrl,
-              duration: this.recordingDuration,
-            };
-          } else if (provider.name === 'azure') {
-            let url: string | undefined;
-            if (typeof (provider as any).getSignedUrl === 'function') {
-              try {
-                url = await (provider as any).getSignedUrl(key, { expiresInSeconds: config.azureBlobStorage.signedUrlTtlSeconds });
-              } catch (e) {
-                this._logger.error('Failed to generate SAS URL for Azure blob. Notification payload will not include an unsigned Azure URL.', e as any);
-              }
-            } else {
-              this._logger.error('Azure storage provider does not support SAS URL generation. Notification payload will not include an Azure URL.');
-            }
-            this.lastUploadedBlobUrl = url;
-            this.lastStorageDetails = {
-              provider: 'azure',
-              accountName: config.azureBlobStorage.accountName,
-              container: config.azureBlobStorage.container,
-              key,
-              url: this.lastUploadedBlobUrl,
-              signedUrlTtlSeconds: config.azureBlobStorage.signedUrlTtlSeconds,
-              blobPrefix: config.azureBlobStorage.blobPrefix,
-              duration: this.recordingDuration,
-            };
+    // Wait for any in-progress segment rotation before uploading the final piece
+    if (this.isRotating) {
+      this._logger.info('Waiting for in-progress segment rotation to finish before final upload...');
+      await new Promise<void>((resolve) => {
+        const check = setInterval(() => {
+          if (!this.isRotating) {
+            clearInterval(check);
+            resolve();
           }
-        } catch (metaErr) {
-          this._logger.warn('Unable to compute storage metadata/url for notification', metaErr as any);
-        }
-        return true;
-      } catch (err) {
-        if (attempt >= maxAttempts) {
-          this._logger.error(`Permanently failed to upload recording to object storage (${provider.name}) after ${maxAttempts} attempts`, err);
-          throw err;
-        } else {
-          this._logger.error(`Failed to upload recording to object storage (${provider.name}) attempt ${attempt} of ${maxAttempts}`, err);
-          const delay = this.RETRY_UPLOAD_DELAY_BASE_MS * Math.pow(2, attempt);
-          await this.delayPromise(delay);
-        }
-      }
+        }, 100);
+      });
     }
 
-    return false;
+    // Wait for all background segment uploads to finish
+    if (this.backgroundUploads.length > 0) {
+      this._logger.info(`Waiting for ${this.backgroundUploads.length} background segment upload(s) to complete...`);
+      const bgResults = await Promise.allSettled(this.backgroundUploads);
+      bgResults.forEach((r, i) => {
+        if (r.status === 'rejected') {
+          this._logger.error(`Background segment upload ${i + 1} rejected`, r.reason);
+        }
+      });
+    }
+
+    const filePath = DiskUploader.getFilePath(this._userId, this._tempFileId, this.fileExtension);
+    const key = this.buildFinalKey();
+
+    const finalResult = await this.uploadSegmentFile(filePath, key, this.segmentIndex);
+
+    if (!finalResult.success) {
+      throw new Error(`Failed to upload final segment to ${provider.name}`);
+    }
+
+    // Build lastStorageDetails with all segments for the notification payload
+    const allSegments = [...this.completedSegments].sort((a, b) => a.index - b.index);
+    const firstUrl = allSegments[0]?.url ?? finalResult.url;
+
+    try {
+      if (provider.name === 's3') {
+        const s3cfg = config.s3CompatibleStorage;
+        this.lastUploadedBlobUrl = firstUrl;
+        this.lastStorageDetails = {
+          provider: 's3',
+          bucket: s3cfg.bucket,
+          region: s3cfg.region,
+          endpoint: s3cfg.endpoint,
+          forcePathStyle: !!s3cfg.forcePathStyle,
+          url: this.lastUploadedBlobUrl,
+          duration: this.recordingDuration,
+          segments: allSegments.map(({ key: k, url: u, index: idx }) => ({ key: k, url: u, index: idx })),
+        };
+      } else if (provider.name === 'azure') {
+        this.lastUploadedBlobUrl = firstUrl;
+        this.lastStorageDetails = {
+          provider: 'azure',
+          accountName: config.azureBlobStorage.accountName,
+          container: config.azureBlobStorage.container,
+          url: this.lastUploadedBlobUrl,
+          signedUrlTtlSeconds: config.azureBlobStorage.signedUrlTtlSeconds,
+          blobPrefix: config.azureBlobStorage.blobPrefix,
+          duration: this.recordingDuration,
+          segments: allSegments.map(({ key: k, url: u, index: idx }) => ({ key: k, url: u, index: idx })),
+        };
+      }
+    } catch (metaErr) {
+      this._logger.warn('Unable to compute storage metadata/url for notification', metaErr as any);
+    }
+
+    this._logger.info(`All segments uploaded successfully. Total: ${allSegments.length}`, { userId: this._userId });
+    return true;
   }
 
   private buildS3CompatibleUrl(uploadConfig: { endpoint?: string; region: string; bucket: string; forcePathStyle: boolean; }, key: string): string | undefined {
@@ -782,15 +908,15 @@ class DiskUploader implements IUploader {
       // Upload recording to configured storage
       if (config.uploaderType === 'screenapp') {
         uploadResult = await this.uploadRecordingToScreenApp();
+        // Screenapp path: delete temp file after upload (segment uploads clean up their own files)
+        await this.deleteTempFileAsync();
       } else if (config.uploaderType === 's3') {
-        // Route to selected object storage provider (S3 or Azure) based on configuration
+        // Route to selected object storage provider (S3 or Azure) based on configuration.
+        // Each segment upload deletes its own temp file, so no deleteTempFileAsync needed here.
         uploadResult = await this.uploadRecordingToObjectStorage();
       } else {
         throw new Error(`Unsupported UPLOADER_TYPE configuration: ${config.uploaderType}`);
       }
-
-      // Delete temp file after the upload is finished
-      await this.deleteTempFileAsync();
 
       // Send optional notifications on success
       if (uploadResult) {
